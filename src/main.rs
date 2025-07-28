@@ -56,7 +56,7 @@ fn parse_response_headers(
             .split_once(":")
             .ok_or_else(|| format!("Malformed header: {}", line))?;
 
-        // TODO: Currently the parsing of headers does not NOT to rfc9110.
+        // TODO: Currently the parsing of headers does not NOT conform to rfc9110.
         // See: https://www.rfc-editor.org/rfc/rfc9110.html#name-field-order
         headers.push(HttpHeader {
             field_name: field_name.trim().to_owned(),
