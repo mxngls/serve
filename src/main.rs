@@ -5,8 +5,6 @@ use std::{
     result::Result,
 };
 
-use jiff::Zoned;
-
 // default logging used by Nginx
 // log_format combined '$remote_addr - $remote_user [$time_local] '
 //                     '"$request" $status $body_bytes_sent '
@@ -73,7 +71,7 @@ fn handle_connection(stream: TcpStream) -> Result<(), Box<dyn Error>> {
 
     let mut response_status = "200";
     let mut response_status_text = "OK";
-    let response_body = format!("Currently it is {}", Zoned::now().time());
+    let response_body = "".to_owned();
 
     if request_method != "GET" {
         response_status = "405";
