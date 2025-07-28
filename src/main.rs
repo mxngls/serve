@@ -86,7 +86,7 @@ fn send_response(
     let response = [
         format!("{HTTP_PROTOCOL} {response_status} {response_status_text}"),
         format!("Content-Length: {response_body_length}",),
-        format!("Content-Type: {}", "text/html"),
+        format!("Content-Type: {}", "text/plain"),
         "".to_string(),
         response_body,
     ]
@@ -147,7 +147,7 @@ fn handle_connection(stream: TcpStream) -> Result<(), Box<dyn Error>> {
             .iter()
             .map(|h| h.to_string())
             .collect::<Vec<_>>()
-            .join("<br>"),
+            .join("\n"),
     )?;
 
     Ok(())
