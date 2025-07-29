@@ -2,17 +2,57 @@ use std::{
     collections::HashMap,
     error::Error,
     fmt,
+    fs::OpenOptions,
     io::{BufRead, BufReader, Lines, Write},
     net::{TcpListener, TcpStream},
     result::Result,
     str::FromStr,
 };
 
-// default logging used by Nginx
-// log_format combined '$remote_addr - $remote_user [$time_local] '
-//                     '"$request" $status $body_bytes_sent '
-//                     '"$http_referer" "$http_user_agent"';
-fn write_request_log() {}
+use jiff::Zoned;
+
+// logs conform to the same format as Nginxs standard combined logs
+fn write_request_log(
+    request: &mut HttpRequest,
+    response: &HttpResponse,
+    remote_addr: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut log_file = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open("log.txt")?;
+
+    let headers = request.headers.take().unwrap_or_default();
+
+    // TODO: Properly obtain remote user
+    let remote_user = "\"-\"".to_string();
+    let time_local = Zoned::now().strftime("%d/%b/%Y:%H:%M:%S %z");
+    let request_line = format!(
+        "{:?} {} {:?}",
+        request.method, request.path, request.version
+    );
+    let status = response.status.code();
+    let body_bytes_sent = response.body.as_ref().map(|b| b.len()).unwrap_or(0);
+    let referer = headers.get("Referer").map_or("-", |h| h);
+    let user_agent = headers.get("User-Agent").map_or("-", |h| h);
+
+    // default logging used by Nginx (nginx)
+    let log_line = format!(
+        "{} - {} [{}] \"{}\" {} {} \"{}\" \"{}\"\n",
+        remote_addr,
+        remote_user,
+        time_local,
+        request_line,
+        status,
+        body_bytes_sent,
+        referer,
+        user_agent
+    );
+
+    write!(log_file, "{}", log_line)?;
+
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum HttpVersion {
@@ -202,10 +242,7 @@ fn parse_response_headers(
 
         // TODO: Currently the parsing of headers does not NOT conform to rfc9110.
         // See: https://www.rfc-editor.org/rfc/rfc9110.html#name-field-order
-        headers.push(HttpHeader {
-            field_name: field_name.trim().to_owned(),
-            field_value: field_value.trim().to_owned(),
-        });
+        headers.insert(field_name.trim().to_owned(), field_value.trim().to_owned());
 
         // In HTTP/1.1 all headers **except** for the host header are optional
         if !has_host && field_name == "Host" && !field_value.is_empty() {
@@ -220,7 +257,7 @@ fn parse_response_headers(
     }
 }
 
-fn send_response(mut stream: TcpStream, response: HttpResponse) -> Result<(), Box<dyn Error>> {
+fn send_response(mut stream: &TcpStream, response: &HttpResponse) -> Result<(), Box<dyn Error>> {
     write!(stream, "{}", response)?;
 
     stream.flush()?;
@@ -247,33 +284,42 @@ fn handle_connection(stream: TcpStream) -> Result<(), Box<dyn Error>> {
 
     if method != HttpMethod::Get {
         let response = HttpResponse::new(HttpStatus::MethodNotAllowed, None, None)?;
-        send_response(stream, response)?;
+        send_response(&stream, &response)?;
         return Ok(());
     }
 
     if version != HttpVersion::HTTP1_1 {
         let response = HttpResponse::new(HttpStatus::HttpVersionNotSupported, None, None)?;
-        send_response(stream, response)?;
+        send_response(&stream, &response)?;
         return Ok(());
     }
 
-    let request = HttpRequest::new(method, target.to_string(), version, headers, None)?;
+    let mut request = HttpRequest::new(method, target.to_string(), version, Some(headers), None)?;
     println!("{:#?}", request);
 
     let response = HttpResponse::new(
         HttpStatus::Ok,
         None,
-        Some(
-            request
+        Some({
+            let mut headers: Vec<String> = request
                 .headers
+                .as_ref()
+                .unwrap_or(&Default::default())
                 .iter()
-                .map(|h| h.to_string())
-                .collect::<Vec<_>>()
-                .join("\n"),
-        ),
+                .map(|(key, value)| format!("{}: {}", key, value))
+                .collect();
+            headers.sort_by(|a, b| {
+                let (k1, _) = a.split_once(":").unwrap_or_default();
+                let (k2, _) = b.split_once(":").unwrap_or_default();
+                k1.cmp(k2)
+            });
+            headers.join("\n")
+        }),
     )?;
 
-    send_response(stream, response)?;
+    send_response(&stream, &response)?;
+
+    write_request_log(&mut request, &response, &stream.peer_addr()?.to_string())?;
 
     Ok(())
 }
