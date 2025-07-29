@@ -4,6 +4,7 @@ use std::{
     io::{BufRead, BufReader, Lines, Write},
     net::{TcpListener, TcpStream},
     result::Result,
+    str::FromStr,
 };
 
 // default logging used by Nginx
@@ -12,21 +13,90 @@ use std::{
 //                     '"$http_referer" "$http_user_agent"';
 fn write_request_log() {}
 
-static HTTP_PROTOCOL: &str = "HTTP/1.1";
-
-enum HttpSupportedMethods {
-    Get,
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum HttpVersion {
+    HTTP1_0,
+    HTTP1_1,
+    HTTP2_0,
 }
 
-impl HttpSupportedMethods {
-    fn as_str(&self) -> &'static str {
-        match self {
-            HttpSupportedMethods::Get => "GET",
+impl fmt::Display for HttpVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let version = match self {
+            HttpVersion::HTTP1_0 => "HTTP/1.0",
+            HttpVersion::HTTP1_1 => "HTTP/1.1",
+            HttpVersion::HTTP2_0 => "HTTP/2.0",
+        };
+        write!(f, "{}", version)
+    }
+}
+
+impl FromStr for HttpVersion {
+    type Err = &'static str;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "HTTP/1.0" => Ok(HttpVersion::HTTP1_0),
+            "HTTP/1.1" => Ok(HttpVersion::HTTP1_1),
+            "HTTP/2.0" => Ok(HttpVersion::HTTP2_0),
+            _ => Err("Unsupported HTTP version"),
         }
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum HttpMethod {
+    Get,
+}
+
+impl fmt::Display for HttpMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let method = match self {
+            HttpMethod::Get => "GET",
+        };
+        write!(f, "{}", method)
+    }
+}
+
+impl FromStr for HttpMethod {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "GET" => Ok(HttpMethod::Get),
+            _ => Err("Unsupported HTTP method"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum HttpStatus {
+    Ok,
+    MethodNotAllowed,
+    HttpVersionNotSupported,
+}
+
+impl fmt::Display for HttpStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let status_text = match self {
+            HttpStatus::Ok => "Ok",
+            HttpStatus::MethodNotAllowed => "Method Not Allowed",
+            HttpStatus::HttpVersionNotSupported => "Http Version Not Supported",
+        };
+        write!(f, "{}", status_text)
+    }
+}
+
+impl HttpStatus {
+    fn code(&self) -> u16 {
+        match &self {
+            HttpStatus::Ok => 200,
+            HttpStatus::MethodNotAllowed => 405,
+            HttpStatus::HttpVersionNotSupported => 505,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 struct HttpHeader {
     field_name: String,
     field_value: String,
@@ -38,8 +108,88 @@ impl fmt::Display for HttpHeader {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct HttpRequest {
+    method: HttpMethod,
+    path: String,
+    version: HttpVersion,
+    headers: Vec<HttpHeader>,
+    body: Option<String>,
+}
+
+impl HttpRequest {
+    fn new(
+        method: HttpMethod,
+        path: String,
+        version: HttpVersion,
+        headers: Vec<HttpHeader>,
+        body: Option<String>,
+    ) -> Result<Self, Box<dyn Error>> {
+        Ok(HttpRequest {
+            method,
+            path,
+            version,
+            headers,
+            body,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct HttpResponse {
+    version: HttpVersion,
+    status: HttpStatus,
+    headers: Option<Vec<HttpHeader>>,
+    body: Option<String>,
+}
+
+impl HttpResponse {
+    fn new(
+        status: HttpStatus,
+        headers: Option<Vec<HttpHeader>>,
+        body: Option<String>,
+    ) -> Result<Self, Box<dyn Error>> {
+        Ok(HttpResponse {
+            version: HttpVersion::HTTP1_1,
+            status,
+            headers,
+            body,
+        })
+    }
+}
+
+impl fmt::Display for HttpResponse {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let body = self.body.as_deref().unwrap_or("");
+        let headers = self.headers.as_deref().unwrap_or(&[]);
+
+        // status line
+        writeln!(f, "{} {} {}", self.version, self.status.code(), self.status)?;
+
+        if !body.is_empty() {
+            writeln!(f, "Content-Length: {}", body.len())?;
+            writeln!(f, "Content-Type: text/plain")?;
+        }
+
+        // headers
+        for header in headers {
+            writeln!(f, "{}", header)?;
+        }
+
+        // empty line
+        writeln!(f)?;
+
+        // body
+        if !body.is_empty() {
+            writeln!(f, "{}", body)?;
+        }
+
+        Ok(())
+    }
+}
+
 fn parse_response_headers(
-    lines: Lines<BufReader<&TcpStream>>,
+    lines: &mut Lines<BufReader<&TcpStream>>,
 ) -> Result<Vec<HttpHeader>, Box<dyn Error>> {
     let mut headers: Vec<HttpHeader> = Vec::new();
     let mut has_host = false;
@@ -54,6 +204,7 @@ fn parse_response_headers(
 
         let (field_name, field_value) = line
             .split_once(":")
+            .map(|(f1, f2)| (f1.trim(), f2.trim()))
             .ok_or_else(|| format!("Malformed header: {}", line))?;
 
         // TODO: Currently the parsing of headers does not NOT conform to rfc9110.
@@ -76,23 +227,9 @@ fn parse_response_headers(
     }
 }
 
-fn send_response(
-    mut stream: TcpStream,
-    response_status: &str,
-    response_status_text: &str,
-    response_body: String,
-) -> Result<(), Box<dyn Error>> {
-    let response_body_length = response_body.len();
-    let response = [
-        format!("{HTTP_PROTOCOL} {response_status} {response_status_text}"),
-        format!("Content-Length: {response_body_length}",),
-        format!("Content-Type: {}", "text/plain"),
-        "".to_string(),
-        response_body,
-    ]
-    .join("\r\n");
+fn send_response(mut stream: TcpStream, response: HttpResponse) -> Result<(), Box<dyn Error>> {
+    write!(stream, "{}", response)?;
 
-    stream.write_all(response.as_bytes())?;
     stream.flush()?;
 
     Ok(())
@@ -105,50 +242,45 @@ fn handle_connection(stream: TcpStream) -> Result<(), Box<dyn Error>> {
         return Err("Empty request".into());
     };
 
-    let [request_method, _request_target, request_protocol] = request_line
+    let [method_str, target, version_str] = request_line
         .split_whitespace()
         .collect::<Vec<&str>>()
         .try_into()
         .map_err(|_| "Invalid request line format")?;
+    let headers = parse_response_headers(&mut lines)?;
 
-    let mut response_status = "200";
-    let mut response_status_text = "OK";
-    let response_body = "".to_owned();
+    let method = method_str.parse()?;
+    let version = version_str.parse()?;
 
-    if request_method != HttpSupportedMethods::Get.as_str() {
-        response_status = "405";
-        response_status_text = "Method Not Allowed";
-
-        send_response(stream, response_status, response_status_text, response_body)?;
-
-        return Ok(());
-    } else if request_protocol != HTTP_PROTOCOL {
-        response_status = "505";
-        response_status_text = "HTTP version not supported";
-
-        send_response(stream, response_status, response_status_text, response_body)?;
-
+    if method != HttpMethod::Get {
+        let response = HttpResponse::new(HttpStatus::MethodNotAllowed, None, None)?;
+        send_response(stream, response)?;
         return Ok(());
     }
 
-    let headers = parse_response_headers(lines)?;
-
-    println!("{}", request_line);
-
-    for header in &headers {
-        println!("{}: {}", header.field_name, header.field_value);
+    if version != HttpVersion::HTTP1_1 {
+        let response = HttpResponse::new(HttpStatus::HttpVersionNotSupported, None, None)?;
+        send_response(stream, response)?;
+        return Ok(());
     }
 
-    send_response(
-        stream,
-        response_status,
-        response_status_text,
-        headers
-            .iter()
-            .map(|h| h.to_string())
-            .collect::<Vec<_>>()
-            .join("\n"),
+    let request = HttpRequest::new(method, target.to_string(), version, headers, None)?;
+    println!("{:#?}", request);
+
+    let response = HttpResponse::new(
+        HttpStatus::Ok,
+        None,
+        Some(
+            request
+                .headers
+                .iter()
+                .map(|h| h.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
     )?;
+
+    send_response(stream, response)?;
 
     Ok(())
 }
