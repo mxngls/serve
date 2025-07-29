@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     error::Error,
     fmt,
     io::{BufRead, BufReader, Lines, Write},
@@ -96,24 +97,15 @@ impl HttpStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-struct HttpHeader {
-    field_name: String,
-    field_value: String,
-}
-
-impl fmt::Display for HttpHeader {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}: {}", self.field_name, self.field_value)
-    }
-}
+/// HTTP headers defined as a type alias to HashMap<String, String>
+type HttpHeaders = HashMap<String, String>;
 
 #[derive(Debug, Clone, PartialEq)]
 struct HttpRequest {
     method: HttpMethod,
     path: String,
     version: HttpVersion,
-    headers: Vec<HttpHeader>,
+    headers: Option<HttpHeaders>,
     body: Option<String>,
 }
 
@@ -122,7 +114,7 @@ impl HttpRequest {
         method: HttpMethod,
         path: String,
         version: HttpVersion,
-        headers: Vec<HttpHeader>,
+        headers: Option<HttpHeaders>,
         body: Option<String>,
     ) -> Result<Self, Box<dyn Error>> {
         Ok(HttpRequest {
@@ -139,14 +131,14 @@ impl HttpRequest {
 struct HttpResponse {
     version: HttpVersion,
     status: HttpStatus,
-    headers: Option<Vec<HttpHeader>>,
+    headers: Option<HttpHeaders>,
     body: Option<String>,
 }
 
 impl HttpResponse {
     fn new(
         status: HttpStatus,
-        headers: Option<Vec<HttpHeader>>,
+        headers: Option<HttpHeaders>,
         body: Option<String>,
     ) -> Result<Self, Box<dyn Error>> {
         Ok(HttpResponse {
@@ -161,7 +153,6 @@ impl HttpResponse {
 impl fmt::Display for HttpResponse {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let body = self.body.as_deref().unwrap_or("");
-        let headers = self.headers.as_deref().unwrap_or(&[]);
 
         // status line
         writeln!(f, "{} {} {}", self.version, self.status.code(), self.status)?;
@@ -172,8 +163,10 @@ impl fmt::Display for HttpResponse {
         }
 
         // headers
-        for header in headers {
-            writeln!(f, "{}", header)?;
+        if let Some(headers) = &self.headers {
+            for (field_name, field_value) in headers.iter() {
+                writeln!(f, "{}: {}", field_name, field_value)?;
+            }
         }
 
         // empty line
@@ -190,8 +183,8 @@ impl fmt::Display for HttpResponse {
 
 fn parse_response_headers(
     lines: &mut Lines<BufReader<&TcpStream>>,
-) -> Result<Vec<HttpHeader>, Box<dyn Error>> {
-    let mut headers: Vec<HttpHeader> = Vec::new();
+) -> Result<HttpHeaders, Box<dyn Error>> {
+    let mut headers: HashMap<String, String> = HashMap::new();
     let mut has_host = false;
 
     for line in lines {
