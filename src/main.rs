@@ -2,56 +2,170 @@ use std::{
     collections::HashMap,
     error::Error,
     fmt,
-    fs::OpenOptions,
-    io::{BufRead, BufReader, Lines, Write},
-    net::{TcpListener, TcpStream},
+    fs::{File, OpenOptions},
+    io::{BufRead, BufReader, BufWriter, Lines, Write},
+    net::{TcpListener, TcpStream, ToSocketAddrs},
     result::Result,
     str::FromStr,
+    sync::Mutex,
 };
 
 use jiff::Zoned;
 
-// logs conform to the same format as Nginxs standard combined logs
-fn write_request_log(
-    request: &mut HttpRequest,
-    response: &HttpResponse,
-    remote_addr: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut log_file = OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open("log.txt")?;
+struct HttpServer {
+    listener: TcpListener,
+    logger: Logger,
+}
 
-    let headers = request.headers.take().unwrap_or_default();
+impl HttpServer {
+    fn new(
+        host: &str,
+        port: u16,
+        log_path: Option<String>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let addr = format!("{}:{}", host, port);
+        let socket_addr = addr
+            .to_socket_addrs()?
+            .next()
+            .ok_or("Failed to resolve address")?;
 
-    // TODO: Properly obtain remote user
-    let remote_user = "\"-\"".to_string();
-    let time_local = Zoned::now().strftime("%d/%b/%Y:%H:%M:%S %z");
-    let request_line = format!(
-        "{:?} {} {:?}",
-        request.method, request.path, request.version
-    );
-    let status = response.status.code();
-    let body_bytes_sent = response.body.as_ref().map(|b| b.len()).unwrap_or(0);
-    let referer = headers.get("Referer").map_or("-", |h| h);
-    let user_agent = headers.get("User-Agent").map_or("-", |h| h);
+        Ok(HttpServer {
+            listener: TcpListener::bind(socket_addr)?,
+            logger: Logger::new(log_path.unwrap_or("log.txt".to_string()))?,
+        })
+    }
 
-    // default logging used by Nginx (nginx)
-    let log_line = format!(
-        "{} - {} [{}] \"{}\" {} {} \"{}\" \"{}\"\n",
-        remote_addr,
-        remote_user,
-        time_local,
-        request_line,
-        status,
-        body_bytes_sent,
-        referer,
-        user_agent
-    );
+    fn handle_connection(&self, stream: TcpStream) -> Result<(), Box<dyn Error>> {
+        let mut lines = BufReader::new(&stream).lines();
 
-    write!(log_file, "{}", log_line)?;
+        let Some(request_line) = lines.next().transpose()? else {
+            return Err("Empty request".into());
+        };
 
-    Ok(())
+        let [method_str, target, version_str] = request_line
+            .split_whitespace()
+            .collect::<Vec<&str>>()
+            .try_into()
+            .map_err(|_| "Invalid request line format")?;
+        let headers = parse_response_headers(&mut lines)?;
+
+        let method = method_str.parse()?;
+        let version = version_str.parse()?;
+
+        if method != HttpMethod::Get {
+            let response = HttpResponse::new(HttpStatus::MethodNotAllowed, None, None)?;
+            send_response(&stream, &response)?;
+            return Ok(());
+        }
+
+        if version != HttpVersion::HTTP1_1 {
+            let response = HttpResponse::new(HttpStatus::HttpVersionNotSupported, None, None)?;
+            send_response(&stream, &response)?;
+            return Ok(());
+        }
+
+        let mut request =
+            HttpRequest::new(method, target.to_string(), version, Some(headers), None)?;
+        println!("{:#?}", request);
+
+        let response = HttpResponse::new(
+            HttpStatus::Ok,
+            None,
+            Some({
+                let mut headers: Vec<String> = request
+                    .headers
+                    .as_ref()
+                    .unwrap_or(&Default::default())
+                    .iter()
+                    .map(|(key, value)| format!("{}: {}", key, value))
+                    .collect();
+                headers.sort_by(|a, b| {
+                    let (k1, _) = a.split_once(":").unwrap_or_default();
+                    let (k2, _) = b.split_once(":").unwrap_or_default();
+                    k1.cmp(k2)
+                });
+                headers.join("\n")
+            }),
+        )?;
+
+        send_response(&stream, &response)?;
+
+        self.logger
+            .write_request_log(&mut request, &response, &stream.peer_addr()?.to_string())?;
+
+        Ok(())
+    }
+
+    fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
+        for stream in self.listener.incoming() {
+            self.handle_connection(stream?)?;
+        }
+        Ok(())
+    }
+}
+
+enum LogFormat {
+    Combined,
+}
+
+struct Logger {
+    writer: Mutex<BufWriter<File>>,
+    _format: LogFormat,
+}
+
+impl Logger {
+    fn new(log_path: String) -> Result<Self, Box<dyn std::error::Error>> {
+        let log_file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(log_path)?;
+
+        Ok(Logger {
+            writer: Mutex::new(BufWriter::new(log_file)),
+            _format: LogFormat::Combined,
+        })
+    }
+
+    // logs conform to the same format as Nginxs standard combined logs
+    fn write_request_log(
+        &self,
+        request: &mut HttpRequest,
+        response: &HttpResponse,
+        remote_addr: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut writer = self.writer.lock().unwrap();
+
+        let headers = request.headers.take().unwrap_or_default();
+
+        // TODO: Properly obtain remote user
+        let remote_user = "\"-\"".to_string();
+        let time_local = Zoned::now().strftime("%d/%b/%Y:%H:%M:%S %z");
+        let request_line = format!(
+            "{:?} {} {:?}",
+            request.method, request.path, request.version
+        );
+        let status = response.status.code();
+        let body_bytes_sent = response.body.as_ref().map(|b| b.len()).unwrap_or(0);
+        let referer = headers.get("Referer").map_or("-", |h| h);
+        let user_agent = headers.get("User-Agent").map_or("-", |h| h);
+
+        // default logging used by Nginx (nginx)
+        let log_line = format!(
+            "{} - {} [{}] \"{}\" {} {} \"{}\" \"{}\"\n",
+            remote_addr,
+            remote_user,
+            time_local,
+            request_line,
+            status,
+            body_bytes_sent,
+            referer,
+            user_agent
+        );
+
+        write!(writer, "{}", log_line)?;
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -265,71 +379,8 @@ fn send_response(mut stream: &TcpStream, response: &HttpResponse) -> Result<(), 
     Ok(())
 }
 
-fn handle_connection(stream: TcpStream) -> Result<(), Box<dyn Error>> {
-    let mut lines = BufReader::new(&stream).lines();
-
-    let Some(request_line) = lines.next().transpose()? else {
-        return Err("Empty request".into());
-    };
-
-    let [method_str, target, version_str] = request_line
-        .split_whitespace()
-        .collect::<Vec<&str>>()
-        .try_into()
-        .map_err(|_| "Invalid request line format")?;
-    let headers = parse_response_headers(&mut lines)?;
-
-    let method = method_str.parse()?;
-    let version = version_str.parse()?;
-
-    if method != HttpMethod::Get {
-        let response = HttpResponse::new(HttpStatus::MethodNotAllowed, None, None)?;
-        send_response(&stream, &response)?;
-        return Ok(());
-    }
-
-    if version != HttpVersion::HTTP1_1 {
-        let response = HttpResponse::new(HttpStatus::HttpVersionNotSupported, None, None)?;
-        send_response(&stream, &response)?;
-        return Ok(());
-    }
-
-    let mut request = HttpRequest::new(method, target.to_string(), version, Some(headers), None)?;
-    println!("{:#?}", request);
-
-    let response = HttpResponse::new(
-        HttpStatus::Ok,
-        None,
-        Some({
-            let mut headers: Vec<String> = request
-                .headers
-                .as_ref()
-                .unwrap_or(&Default::default())
-                .iter()
-                .map(|(key, value)| format!("{}: {}", key, value))
-                .collect();
-            headers.sort_by(|a, b| {
-                let (k1, _) = a.split_once(":").unwrap_or_default();
-                let (k2, _) = b.split_once(":").unwrap_or_default();
-                k1.cmp(k2)
-            });
-            headers.join("\n")
-        }),
-    )?;
-
-    send_response(&stream, &response)?;
-
-    write_request_log(&mut request, &response, &stream.peer_addr()?.to_string())?;
-
-    Ok(())
-}
-
 fn main() -> Result<(), Box<dyn Error>> {
-    let listener = TcpListener::bind("127.0.0.1:9000")?;
-
-    for stream in listener.incoming() {
-        handle_connection(stream?)?;
-    }
+    HttpServer::new("localhost", 9000, Some("log.txt".to_string()))?.run()?;
 
     Ok(())
 }
