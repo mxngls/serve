@@ -108,6 +108,27 @@ enum LogFormat {
     Combined,
 }
 
+#[allow(clippy::too_many_arguments)]
+impl LogFormat {
+    fn format(
+        &self,
+        remote_addr: &str,
+        remote_user: &str,
+        time_local: &str,
+        request_line: &str,
+        status: u16,
+        body_bytes_sent: usize,
+        referer: &str,
+        user_agent: &str,
+    ) -> String {
+        match self {
+            LogFormat::Combined => format!(
+                "{remote_addr} - {remote_user} [{time_local}] \"{request_line}\" {status} {body_bytes_sent} \"{referer}\" \"{user_agent}\"",
+            ),
+        }
+    }
+}
+
 struct Logger {
     writer: Mutex<BufWriter<File>>,
     _format: LogFormat,
@@ -139,7 +160,7 @@ impl Logger {
 
         // TODO: Properly obtain remote user
         let remote_user = "\"-\"".to_string();
-        let time_local = Zoned::now().strftime("%d/%b/%Y:%H:%M:%S %z");
+        let time_local = Zoned::now().strftime("%d/%b/%Y:%H:%M:%S %z").to_string();
         let request_line = format!(
             "{:?} {} {:?}",
             request.method, request.path, request.version
@@ -150,16 +171,15 @@ impl Logger {
         let user_agent = headers.get("User-Agent").map_or("-", |h| h);
 
         // default logging used by Nginx (nginx)
-        let log_line = format!(
-            "{} - {} [{}] \"{}\" {} {} \"{}\" \"{}\"\n",
+        let log_line = LogFormat::Combined.format(
             remote_addr,
-            remote_user,
-            time_local,
-            request_line,
+            &remote_user,
+            &time_local,
+            &request_line,
             status,
             body_bytes_sent,
             referer,
-            user_agent
+            user_agent,
         );
 
         write!(writer, "{}", log_line)?;
