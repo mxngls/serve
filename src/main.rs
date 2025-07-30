@@ -68,25 +68,32 @@ impl HttpServer {
             HttpRequest::new(method, target.to_string(), version, Some(headers), None)?;
         println!("{:#?}", request);
 
-        let response = HttpResponse::new(
-            HttpStatus::Ok,
-            None,
-            Some({
-                let mut headers: Vec<String> = request
-                    .headers
-                    .as_ref()
-                    .unwrap_or(&Default::default())
-                    .iter()
-                    .map(|(key, value)| format!("{}: {}", key, value))
-                    .collect();
-                headers.sort_by(|a, b| {
-                    let (k1, _) = a.split_once(":").unwrap_or_default();
-                    let (k2, _) = b.split_once(":").unwrap_or_default();
-                    k1.cmp(k2)
-                });
-                headers.join("\n")
-            }),
-        )?;
+        let response_body = {
+            let mut headers: Vec<String> = request
+                .headers
+                .as_ref()
+                .unwrap_or(&Default::default())
+                .iter()
+                .map(|(key, value)| format!("{}: {}", key, value))
+                .collect();
+
+            headers.sort_by(|a, b| {
+                let (k1, _) = a.split_once(":").unwrap_or_default();
+                let (k2, _) = b.split_once(":").unwrap_or_default();
+                k1.cmp(k2)
+            });
+
+            headers.insert(
+                0,
+                format!(
+                    "Received request at {} with the following headers:\n",
+                    Zoned::now().strftime("%d/%b/%Y:%H:%M:%S %z")
+                ),
+            );
+
+            headers.join("\n")
+        };
+        let response = HttpResponse::new(HttpStatus::Ok, None, Some(response_body))?;
 
         send_response(&stream, &response)?;
 
