@@ -47,7 +47,7 @@ impl HttpServer {
             .collect::<Vec<&str>>()
             .try_into()
             .map_err(|_| "Invalid request line format")?;
-        let headers = parse_response_headers(&mut lines)?;
+        let headers = parse_request_headers(&mut lines)?;
 
         let method = method_str.parse()?;
         let version = version_str.parse()?;
@@ -335,7 +335,7 @@ impl fmt::Display for HttpResponse {
     }
 }
 
-fn parse_response_headers(
+fn parse_request_headers(
     lines: &mut Lines<BufReader<&TcpStream>>,
 ) -> Result<HttpHeaders, Box<dyn Error>> {
     let mut headers: HashMap<String, String> = HashMap::new();
