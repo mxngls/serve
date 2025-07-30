@@ -47,20 +47,20 @@ impl HttpServer {
             .collect::<Vec<&str>>()
             .try_into()
             .map_err(|_| "Invalid request line format")?;
-        let headers = parse_request_headers(&mut lines)?;
+        let headers = self.parse_request_headers(&mut lines)?;
 
         let method = method_str.parse()?;
         let version = version_str.parse()?;
 
         if method != HttpMethod::Get {
             let response = HttpResponse::new(HttpStatus::MethodNotAllowed, None, None)?;
-            send_response(&stream, &response)?;
+            self.send_response(&stream, &response)?;
             return Ok(());
         }
 
         if version != HttpVersion::HTTP1_1 {
             let response = HttpResponse::new(HttpStatus::HttpVersionNotSupported, None, None)?;
-            send_response(&stream, &response)?;
+            self.send_response(&stream, &response)?;
             return Ok(());
         }
 
@@ -95,7 +95,7 @@ impl HttpServer {
         };
         let response = HttpResponse::new(HttpStatus::Ok, None, Some(response_body))?;
 
-        send_response(&stream, &response)?;
+        self.send_response(&stream, &response)?;
 
         self.logger
             .write_request_log(&mut request, &response, &stream.peer_addr()?.to_string())?;
@@ -107,6 +107,55 @@ impl HttpServer {
         for stream in self.listener.incoming() {
             self.handle_connection(stream?)?;
         }
+        Ok(())
+    }
+
+    fn parse_request_headers(
+        &self,
+        lines: &mut Lines<BufReader<&TcpStream>>,
+    ) -> Result<HttpHeaders, Box<dyn Error>> {
+        let mut headers: HashMap<String, String> = HashMap::new();
+        let mut has_host = false;
+
+        for line in lines {
+            let line = line?;
+
+            // end of headers
+            if line.is_empty() {
+                break;
+            };
+
+            let (field_name, field_value) = line
+                .split_once(":")
+                .map(|(f1, f2)| (f1.trim(), f2.trim()))
+                .ok_or_else(|| format!("Malformed header: {}", line))?;
+
+            // TODO: Currently the parsing of headers does not NOT conform to rfc9110.
+            // See: https://www.rfc-editor.org/rfc/rfc9110.html#name-field-order
+            headers.insert(field_name.trim().to_owned(), field_value.trim().to_owned());
+
+            // In HTTP/1.1 all headers **except** for the host header are optional
+            if !has_host && field_name == "Host" && !field_value.is_empty() {
+                has_host = true
+            };
+        }
+
+        if !has_host {
+            Err("Missing Host header".into())
+        } else {
+            Ok(headers)
+        }
+    }
+
+    fn send_response(
+        &self,
+        mut stream: &TcpStream,
+        response: &HttpResponse,
+    ) -> Result<(), Box<dyn Error>> {
+        write!(stream, "{}", response)?;
+
+        stream.flush()?;
+
         Ok(())
     }
 }
@@ -362,52 +411,10 @@ impl fmt::Display for HttpResponse {
     }
 }
 
-fn parse_request_headers(
-    lines: &mut Lines<BufReader<&TcpStream>>,
-) -> Result<HttpHeaders, Box<dyn Error>> {
-    let mut headers: HashMap<String, String> = HashMap::new();
-    let mut has_host = false;
-
-    for line in lines {
-        let line = line?;
-
-        // end of headers
-        if line.is_empty() {
-            break;
-        };
-
-        let (field_name, field_value) = line
-            .split_once(":")
-            .map(|(f1, f2)| (f1.trim(), f2.trim()))
-            .ok_or_else(|| format!("Malformed header: {}", line))?;
-
-        // TODO: Currently the parsing of headers does not NOT conform to rfc9110.
-        // See: https://www.rfc-editor.org/rfc/rfc9110.html#name-field-order
-        headers.insert(field_name.trim().to_owned(), field_value.trim().to_owned());
-
-        // In HTTP/1.1 all headers **except** for the host header are optional
-        if !has_host && field_name == "Host" && !field_value.is_empty() {
-            has_host = true
-        };
-    }
-
-    if !has_host {
-        Err("Missing Host header".into())
-    } else {
-        Ok(headers)
-    }
-}
-
-fn send_response(mut stream: &TcpStream, response: &HttpResponse) -> Result<(), Box<dyn Error>> {
-    write!(stream, "{}", response)?;
-
-    stream.flush()?;
-
-    Ok(())
-}
-
 fn main() -> Result<(), Box<dyn Error>> {
-    HttpServer::new("localhost", 9000, Some("log.txt".to_string()))?.run()?;
+    let server = HttpServer::new("localhost", 9000, Some("log.txt".to_string()))?;
+
+    server.run()?;
 
     Ok(())
 }
