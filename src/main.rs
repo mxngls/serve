@@ -1,15 +1,13 @@
-use std::{
-    collections::HashMap,
-    env,
-    error::Error,
-    fmt,
-    fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader, BufWriter, Lines, Write},
-    net::{TcpListener, TcpStream, ToSocketAddrs},
-    result::Result,
-    str::FromStr,
-    sync::Mutex,
-};
+use std::collections::HashMap;
+use std::env;
+use std::error::Error;
+use std::fmt;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, BufWriter, Lines, Write};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::result::Result;
+use std::str::FromStr;
+use std::sync::Mutex;
 
 use jiff::Zoned;
 
