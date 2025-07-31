@@ -35,43 +35,25 @@ impl HttpFileServer {
     }
 
     fn handle_connection(&self, stream: TcpStream) -> Result<(), Box<dyn Error>> {
-        let mut lines = BufReader::new(&stream).lines();
+        let request = self.build_request(&stream)?;
 
-        let Some(request_line) = lines.next().transpose()? else {
-            return Err("Empty request".into());
-        };
+        let source_dir = env::current_dir()?;
+        let project_dir = source_dir.parent().unwrap();
+        let file_path = project_dir.join(request.path.trim_start_matches('/'));
 
-        let [method_str, target, version_str] = request_line
-            .split_whitespace()
-            .collect::<Vec<&str>>()
-            .try_into()
-            .map_err(|_| "Invalid request line format")?;
-        let headers = self.parse_request_headers(&mut lines)?;
-
-        let method = method_str.parse()?;
-        let version = version_str.parse()?;
-
-        if method != HttpMethod::Get {
+        if request.method != HttpMethod::Get {
             return self.send_response(
                 &stream,
                 &HttpResponse::new(HttpStatus::MethodNotAllowed, None, None)?,
             );
         }
 
-        if version != HttpVersion::HTTP1_1 {
+        if request.version != HttpVersion::HTTP1_1 {
             return self.send_response(
                 &stream,
                 &HttpResponse::new(HttpStatus::HttpVersionNotSupported, None, None)?,
             );
         }
-
-        let mut request =
-            HttpRequest::new(method, target.to_string(), version, Some(headers), None)?;
-        println!("{:#?}", request);
-
-        let source_dir = env::current_dir()?;
-        let project_dir = source_dir.parent().unwrap();
-        let file_path = project_dir.join(target.trim_start_matches('/'));
 
         let response_body = match file_path.try_exists() {
             Ok(true) => fs::read_to_string(file_path)?,
@@ -87,9 +69,8 @@ impl HttpFileServer {
         let response = HttpResponse::new(HttpStatus::Ok, Some(headers), Some(response_body))?;
 
         self.send_response(&stream, &response)?;
-
         self.logger
-            .write_request_log(&mut request, &response, &stream.peer_addr()?.to_string())?;
+            .write_request_log(&request, &response, &stream.peer_addr()?.to_string())?;
 
         Ok(())
     }
@@ -136,6 +117,28 @@ impl HttpFileServer {
         } else {
             Ok(headers)
         }
+    }
+
+    fn build_request(&self, stream: &TcpStream) -> Result<HttpRequest, Box<dyn Error>> {
+        let mut lines = BufReader::new(stream).lines();
+
+        let Some(request_line) = lines.next().transpose()? else {
+            return Err("Empty request".into());
+        };
+
+        let [method_str, target, version_str] = request_line
+            .split_whitespace()
+            .collect::<Vec<&str>>()
+            .try_into()
+            .map_err(|_| "Invalid request line format")?;
+        let headers = self.parse_request_headers(&mut lines)?;
+
+        let method = method_str.parse()?;
+        let version = version_str.parse()?;
+
+        let request = HttpRequest::new(method, target.to_string(), version, Some(headers), None)?;
+
+        Ok(request)
     }
 
     fn send_response(
@@ -197,13 +200,14 @@ impl Logger {
     // logs conform to the same format as Nginxs standard combined logs
     fn write_request_log(
         &self,
-        request: &mut HttpRequest,
+        request: &HttpRequest,
         response: &HttpResponse,
         remote_addr: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut writer = self.writer.lock().unwrap();
 
-        let headers = request.headers.take().unwrap_or_default();
+        let default = &Default::default();
+        let headers = request.headers.as_ref().unwrap_or(default);
 
         // TODO: Properly obtain remote user
         let remote_user = "\"-\"".to_string();
@@ -227,9 +231,9 @@ impl Logger {
             body_bytes_sent,
             referer,
             user_agent,
-        );
+        ) + "\n";
 
-        write!(writer, "{}", log_line)?;
+        writer.write_all(log_line.as_bytes())?;
 
         Ok(())
     }
@@ -406,7 +410,8 @@ impl fmt::Display for HttpResponse {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let server = HttpFileServer::new("localhost", 9000, Some("log.txt".to_string()))?;
+    let log_path = "./log.txt".to_string();
+    let server = HttpFileServer::new("localhost", 9000, Some(log_path))?;
 
     server.run()?;
 
