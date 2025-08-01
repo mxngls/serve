@@ -21,21 +21,23 @@ impl HttpServer {
         port: u16,
         log_path: Option<String>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let addr = format!("{}:{}", host, port);
+        let addr = format!("{host}:{port}");
         let socket_addr = addr
             .to_socket_addrs()?
             .next()
             .ok_or("Failed to resolve address")?;
 
-        Ok(HttpServer {
+        let log_path = log_path.unwrap_or_else(|| "log.txt".to_string());
+
+        Ok(Self {
             listener: TcpListener::bind(socket_addr)?,
-            logger: Logger::new(log_path.unwrap_or("log.txt".to_string()))?,
+            logger: Logger::new(log_path)?,
         })
     }
 
     fn handle_connection(&self, mut stream: TcpStream) -> Result<(), Box<dyn Error>> {
-        let request = self.build_request(&stream)?;
-        let response = self.build_response(&request)?;
+        let request = Self::build_request(&stream)?;
+        let response = Self::build_response(&request);
 
         stream.write_all(response.to_string().as_bytes())?;
         stream.flush()?;
@@ -54,7 +56,6 @@ impl HttpServer {
     }
 
     fn parse_request_headers(
-        &self,
         lines: &mut Lines<BufReader<&TcpStream>>,
     ) -> Result<HttpHeaders, Box<dyn Error>> {
         let mut headers: HashMap<String, String> = HashMap::new();
@@ -66,12 +67,12 @@ impl HttpServer {
             // end of headers
             if line.is_empty() {
                 break;
-            };
+            }
 
             let (field_name, field_value) = line
-                .split_once(":")
+                .split_once(':')
                 .map(|(f1, f2)| (f1.trim(), f2.trim()))
-                .ok_or_else(|| format!("Malformed header: {}", line))?;
+                .ok_or_else(|| format!("Malformed header: {line}"))?;
 
             // TODO: Currently the parsing of headers does not NOT conform to rfc9110.
             // See: https://www.rfc-editor.org/rfc/rfc9110.html#name-field-order
@@ -79,18 +80,18 @@ impl HttpServer {
 
             // In HTTP/1.1 all headers **except** for the host header are optional
             if !has_host && field_name == "Host" && !field_value.is_empty() {
-                has_host = true
-            };
+                has_host = true;
+            }
         }
 
-        if !has_host {
-            Err("Missing Host header".into())
-        } else {
+        if has_host {
             Ok(headers)
+        } else {
+            Err("Missing Host header".into())
         }
     }
 
-    fn build_request(&self, stream: &TcpStream) -> Result<HttpRequest, Box<dyn Error>> {
+    fn build_request(stream: &TcpStream) -> Result<HttpRequest, Box<dyn Error>> {
         let mut lines = BufReader::new(stream).lines();
 
         let Some(request_line) = lines.next().transpose()? else {
@@ -102,39 +103,39 @@ impl HttpServer {
             .collect::<Vec<&str>>()
             .try_into()
             .map_err(|_| "Invalid request line format")?;
-        let headers = self.parse_request_headers(&mut lines)?;
+        let headers = Self::parse_request_headers(&mut lines)?;
 
         let method = method_str.parse()?;
         let version = version_str.parse()?;
 
-        let request = HttpRequest::new(method, target.to_string(), version, Some(headers), None)?;
+        let request = HttpRequest::new(method, target.to_string(), version, Some(headers), None);
 
         Ok(request)
     }
 
-    fn build_response(&self, request: &HttpRequest) -> Result<HttpResponse, Box<dyn Error>> {
+    fn build_response(request: &HttpRequest) -> HttpResponse {
         if request.method != HttpMethod::Get {
-            let response = HttpResponse::new(HttpStatus::MethodNotAllowed, None, None)?;
-            return Ok(response);
+            return HttpResponse::new(HttpStatus::MethodNotAllowed, None, None);
         }
 
         if request.version != HttpVersion::HTTP1_1 {
-            let response = HttpResponse::new(HttpStatus::HttpVersionNotSupported, None, None)?;
-            return Ok(response);
+            return HttpResponse::new(HttpStatus::HttpVersionNotSupported, None, None);
         }
 
-        let response_body = {
+        let body = {
             let mut headers: Vec<String> = request
                 .headers
                 .as_ref()
-                .unwrap_or(&Default::default())
-                .iter()
-                .map(|(key, value)| format!("{}: {}", key, value))
-                .collect();
+                .map(|h| {
+                    h.iter()
+                        .map(|(key, value)| format!("{key}: {value}"))
+                        .collect()
+                })
+                .unwrap_or_default();
 
             headers.sort_by(|a, b| {
-                let (k1, _) = a.split_once(":").unwrap_or_default();
-                let (k2, _) = b.split_once(":").unwrap_or_default();
+                let (k1, _) = a.split_once(':').unwrap_or_default();
+                let (k2, _) = b.split_once(':').unwrap_or_default();
                 k1.cmp(k2)
             });
 
@@ -149,9 +150,7 @@ impl HttpServer {
             headers.join("\n")
         };
 
-        let response = HttpResponse::new(HttpStatus::Ok, None, Some(response_body))?;
-
-        Ok(response)
+        HttpResponse::new(HttpStatus::Ok, None, Some(body))
     }
 }
 
@@ -173,7 +172,7 @@ impl LogFormat {
         user_agent: &str,
     ) -> String {
         match self {
-            LogFormat::Combined => format!(
+            Self::Combined => format!(
                 "{remote_addr} - {remote_user} [{time_local}] \"{request_line}\" {status} {body_bytes_sent} \"{referer}\" \"{user_agent}\"",
             ),
         }
@@ -192,7 +191,7 @@ impl Logger {
             .create(true)
             .open(log_path)?;
 
-        Ok(Logger {
+        Ok(Self {
             writer: Mutex::new(BufWriter::new(log_file)),
             _format: LogFormat::Combined,
         })
@@ -205,9 +204,7 @@ impl Logger {
         response: &HttpResponse,
         remote_addr: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let mut writer = self.writer.lock().unwrap();
-
-        let default = &Default::default();
+        let default = &HashMap::default();
         let headers = request.headers.as_ref().unwrap_or(default);
 
         // TODO: Properly obtain remote user
@@ -218,7 +215,7 @@ impl Logger {
             request.method, request.path, request.version
         );
         let status = response.status.code();
-        let body_bytes_sent = response.body.as_ref().map(|b| b.len()).unwrap_or(0);
+        let body_bytes_sent = response.body.as_ref().map_or(0, String::len);
         let referer = headers.get("Referer").map_or("-", |h| h);
         let user_agent = headers.get("User-Agent").map_or("-", |h| h);
 
@@ -234,7 +231,7 @@ impl Logger {
             user_agent,
         ) + "\n";
 
-        writer.write_all(log_line.as_bytes())?;
+        self.writer.lock().unwrap().write_all(log_line.as_bytes())?;
 
         Ok(())
     }
@@ -250,11 +247,11 @@ enum HttpVersion {
 impl fmt::Display for HttpVersion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let version = match self {
-            HttpVersion::HTTP1_0 => "HTTP/1.0",
-            HttpVersion::HTTP1_1 => "HTTP/1.1",
-            HttpVersion::HTTP2_0 => "HTTP/2.0",
+            Self::HTTP1_0 => "HTTP/1.0",
+            Self::HTTP1_1 => "HTTP/1.1",
+            Self::HTTP2_0 => "HTTP/2.0",
         };
-        write!(f, "{}", version)
+        write!(f, "{version}")
     }
 }
 
@@ -262,9 +259,9 @@ impl FromStr for HttpVersion {
     type Err = &'static str;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "HTTP/1.0" => Ok(HttpVersion::HTTP1_0),
-            "HTTP/1.1" => Ok(HttpVersion::HTTP1_1),
-            "HTTP/2.0" => Ok(HttpVersion::HTTP2_0),
+            "HTTP/1.0" => Ok(Self::HTTP1_0),
+            "HTTP/1.1" => Ok(Self::HTTP1_1),
+            "HTTP/2.0" => Ok(Self::HTTP2_0),
             _ => Err("Unsupported HTTP version"),
         }
     }
@@ -278,9 +275,9 @@ enum HttpMethod {
 impl fmt::Display for HttpMethod {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let method = match self {
-            HttpMethod::Get => "GET",
+            Self::Get => "GET",
         };
-        write!(f, "{}", method)
+        write!(f, "{method}")
     }
 }
 
@@ -289,7 +286,7 @@ impl FromStr for HttpMethod {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "GET" => Ok(HttpMethod::Get),
+            "GET" => Ok(Self::Get),
             _ => Err("Unsupported HTTP method"),
         }
     }
@@ -305,25 +302,25 @@ enum HttpStatus {
 impl fmt::Display for HttpStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let status_text = match self {
-            HttpStatus::Ok => "Ok",
-            HttpStatus::MethodNotAllowed => "Method Not Allowed",
-            HttpStatus::HttpVersionNotSupported => "Http Version Not Supported",
+            Self::Ok => "Ok",
+            Self::MethodNotAllowed => "Method Not Allowed",
+            Self::HttpVersionNotSupported => "Http Version Not Supported",
         };
-        write!(f, "{}", status_text)
+        write!(f, "{status_text}")
     }
 }
 
 impl HttpStatus {
-    fn code(&self) -> u16 {
+    const fn code(self) -> u16 {
         match &self {
-            HttpStatus::Ok => 200,
-            HttpStatus::MethodNotAllowed => 405,
-            HttpStatus::HttpVersionNotSupported => 505,
+            Self::Ok => 200,
+            Self::MethodNotAllowed => 405,
+            Self::HttpVersionNotSupported => 505,
         }
     }
 }
 
-/// HTTP headers defined as a type alias to HashMap<String, String>
+/// HTTP headers defined as a type alias to `HashMap<String, String>`
 type HttpHeaders = HashMap<String, String>;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -336,20 +333,20 @@ struct HttpRequest {
 }
 
 impl HttpRequest {
-    fn new(
+    const fn new(
         method: HttpMethod,
         path: String,
         version: HttpVersion,
         headers: Option<HttpHeaders>,
         body: Option<String>,
-    ) -> Result<Self, Box<dyn Error>> {
-        Ok(HttpRequest {
+    ) -> Self {
+        Self {
             method,
             path,
             version,
             headers,
             body,
-        })
+        }
     }
 }
 
@@ -362,17 +359,13 @@ struct HttpResponse {
 }
 
 impl HttpResponse {
-    fn new(
-        status: HttpStatus,
-        headers: Option<HttpHeaders>,
-        body: Option<String>,
-    ) -> Result<Self, Box<dyn Error>> {
-        Ok(HttpResponse {
+    const fn new(status: HttpStatus, headers: Option<HttpHeaders>, body: Option<String>) -> Self {
+        Self {
             version: HttpVersion::HTTP1_1,
             status,
             headers,
             body,
-        })
+        }
     }
 }
 
@@ -390,8 +383,8 @@ impl fmt::Display for HttpResponse {
 
         // headers
         if let Some(headers) = &self.headers {
-            for (field_name, field_value) in headers.iter() {
-                writeln!(f, "{}: {}", field_name, field_value)?;
+            for (field_name, field_value) in headers {
+                writeln!(f, "{field_name}: {field_value}")?;
             }
         }
 
@@ -400,7 +393,7 @@ impl fmt::Display for HttpResponse {
 
         // body
         if !body.is_empty() {
-            writeln!(f, "{}", body)?;
+            writeln!(f, "{body}")?;
         }
 
         Ok(())
