@@ -1,8 +1,9 @@
 use std::{
     collections::HashMap,
+    env,
     error::Error,
     fmt,
-    fs::{File, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, BufWriter, Lines, Write},
     net::{TcpListener, TcpStream, ToSocketAddrs},
     result::Result,
@@ -70,32 +71,22 @@ impl HttpFileServer {
             HttpRequest::new(method, target.to_string(), version, Some(headers), None)?;
         println!("{:#?}", request);
 
-        let response_body = {
-            let mut headers: Vec<String> = request
-                .headers
-                .as_ref()
-                .unwrap_or(&Default::default())
-                .iter()
-                .map(|(key, value)| format!("{}: {}", key, value))
-                .collect();
+        let source_dir = env::current_dir()?;
+        let project_dir = source_dir.parent().unwrap();
+        let file_path = project_dir.join(target.trim_start_matches('/'));
 
-            headers.sort_by(|a, b| {
-                let (k1, _) = a.split_once(":").unwrap_or_default();
-                let (k2, _) = b.split_once(":").unwrap_or_default();
-                k1.cmp(k2)
-            });
-
-            headers.insert(
-                0,
-                format!(
-                    "Received request at {} with the following headers:\n",
-                    Zoned::now().strftime("%d/%b/%Y:%H:%M:%S %z")
-                ),
-            );
-
-            headers.join("\n")
+        let response_body = match file_path.try_exists() {
+            Ok(true) => fs::read_to_string(file_path)?,
+            _ => {
+                return self.send_response(
+                    &stream,
+                    &HttpResponse::new(HttpStatus::NotFound, None, None)?,
+                );
+            }
         };
-        let response = HttpResponse::new(HttpStatus::Ok, None, Some(response_body))?;
+        let mut headers = HttpHeaders::new();
+        headers.insert("Content-Type".to_string(), "text/plain".to_string());
+        let response = HttpResponse::new(HttpStatus::Ok, Some(headers), Some(response_body))?;
 
         self.send_response(&stream, &response)?;
 
@@ -116,7 +107,7 @@ impl HttpFileServer {
         &self,
         lines: &mut Lines<BufReader<&TcpStream>>,
     ) -> Result<HttpHeaders, Box<dyn Error>> {
-        let mut headers: HashMap<String, String> = HashMap::new();
+        let mut headers = HttpHeaders::new();
         let mut has_host = false;
 
         for line in lines {
@@ -303,17 +294,19 @@ impl FromStr for HttpMethod {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum HttpStatus {
-    Ok,
-    MethodNotAllowed,
     HttpVersionNotSupported,
+    MethodNotAllowed,
+    NotFound,
+    Ok,
 }
 
 impl fmt::Display for HttpStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let status_text = match self {
-            HttpStatus::Ok => "Ok",
-            HttpStatus::MethodNotAllowed => "Method Not Allowed",
             HttpStatus::HttpVersionNotSupported => "Http Version Not Supported",
+            HttpStatus::MethodNotAllowed => "Method Not Allowed",
+            HttpStatus::NotFound => "Not Found",
+            HttpStatus::Ok => "Ok",
         };
         write!(f, "{}", status_text)
     }
@@ -322,9 +315,10 @@ impl fmt::Display for HttpStatus {
 impl HttpStatus {
     fn code(&self) -> u16 {
         match &self {
-            HttpStatus::Ok => 200,
-            HttpStatus::MethodNotAllowed => 405,
             HttpStatus::HttpVersionNotSupported => 505,
+            HttpStatus::MethodNotAllowed => 405,
+            HttpStatus::NotFound => 404,
+            HttpStatus::Ok => 200,
         }
     }
 }
