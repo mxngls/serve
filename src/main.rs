@@ -12,12 +12,12 @@ use std::{
 
 use jiff::Zoned;
 
-struct HttpServer {
+struct HttpFileServer {
     listener: TcpListener,
     logger: Logger,
 }
 
-impl HttpServer {
+impl HttpFileServer {
     fn new(
         host: &str,
         port: u16,
@@ -29,7 +29,7 @@ impl HttpServer {
             .next()
             .ok_or("Failed to resolve address")?;
 
-        Ok(HttpServer {
+        Ok(HttpFileServer {
             listener: TcpListener::bind(socket_addr)?,
             logger: Logger::new(log_path.unwrap_or("log.txt".to_string()))?,
         })
@@ -412,7 +412,7 @@ impl fmt::Display for HttpResponse {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let server = HttpServer::new("localhost", 9000, Some("log.txt".to_string()))?;
+    let server = HttpFileServer::new("localhost", 9000, Some("log.txt".to_string()))?;
 
     server.run()?;
 
