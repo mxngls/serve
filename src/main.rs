@@ -53,15 +53,17 @@ impl HttpFileServer {
         let version = version_str.parse()?;
 
         if method != HttpMethod::Get {
-            let response = HttpResponse::new(HttpStatus::MethodNotAllowed, None, None)?;
-            self.send_response(&stream, &response)?;
-            return Ok(());
+            return self.send_response(
+                &stream,
+                &HttpResponse::new(HttpStatus::MethodNotAllowed, None, None)?,
+            );
         }
 
         if version != HttpVersion::HTTP1_1 {
-            let response = HttpResponse::new(HttpStatus::HttpVersionNotSupported, None, None)?;
-            self.send_response(&stream, &response)?;
-            return Ok(());
+            return self.send_response(
+                &stream,
+                &HttpResponse::new(HttpStatus::HttpVersionNotSupported, None, None)?,
+            );
         }
 
         let mut request =
