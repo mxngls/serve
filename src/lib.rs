@@ -1,12 +1,12 @@
 #![allow(clippy::missing_errors_doc)]
 
 use std::collections::HashMap;
-use std::env;
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Lines, Write};
+use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Lines, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::path::{Path, PathBuf};
 use std::result::Result;
 use std::str::FromStr;
 use std::sync::Mutex;
@@ -15,6 +15,7 @@ use jiff::Zoned;
 
 pub struct HttpFileServer {
     listener: TcpListener,
+    root_dir: PathBuf,
     logger: Logger,
 }
 
@@ -100,7 +101,12 @@ impl FromStr for Mime {
 }
 
 impl HttpFileServer {
-    pub fn new(host: &str, port: u16, logger: Logger) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(
+        host: &str,
+        port: u16,
+        root_dir: PathBuf,
+        logger: Logger,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let addr = format!("{host}:{port}");
         let socket_addr = addr
             .to_socket_addrs()?
@@ -109,17 +115,20 @@ impl HttpFileServer {
 
         Ok(Self {
             listener: TcpListener::bind(socket_addr)?,
+            root_dir,
             logger,
         })
     }
 
+    pub fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
+        for stream in self.listener.incoming() {
+            self.handle_connection(&stream?)?;
+        }
+        Ok(())
+    }
+
     fn handle_connection(&self, stream: &TcpStream) -> Result<(), Box<dyn Error>> {
         let request = HttpRequest::from_stream(stream)?;
-
-        let project_dir = env::current_dir()?;
-        let file_path = project_dir.join(request.path.trim_start_matches('/'));
-
-        println!("{}", file_path.display());
 
         if request.method != HttpMethod::Get {
             return Self::send_response(
@@ -135,26 +144,30 @@ impl HttpFileServer {
             );
         }
 
-        let response_body = match file_path.try_exists() {
-            Ok(true) => fs::read_to_string(&file_path)?,
-            _ => {
-                return Self::send_response(
-                    stream,
-                    &HttpResponse::new(HttpStatus::NotFound, None, None),
-                );
+        // match the request URI to actual file paths
+        let path = match Self::resolve_uri(request.uri.as_str(), &self.root_dir) {
+            Ok(path) => path,
+            Err(err) => {
+                let status = match err.kind() {
+                    ErrorKind::PermissionDenied => HttpStatus::Forbidden,
+                    ErrorKind::NotFound => HttpStatus::NotFound,
+                    _ => HttpStatus::InternalServerError,
+                };
+                return Self::send_response(stream, &HttpResponse::new(status, None, None));
             }
         };
-
-        let mut headers = HttpHeaders::new();
+        let response_body = fs::read_to_string(&path)?;
 
         // handle the case where ther might be no extension or invalid UTF-8
-        let mime_type_str = file_path
+        let mime_type_str = path
             .extension()
             .and_then(|ext| ext.to_str())
             .and_then(|ext_str| ext_str.parse().ok())
             .map_or(Mime::Binary, |mime| mime)
             .as_str()
             .to_string();
+
+        let mut headers = HttpHeaders::new();
 
         headers.insert("Content-Type".to_string(), mime_type_str);
 
@@ -167,11 +180,37 @@ impl HttpFileServer {
         Ok(())
     }
 
-    pub fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
-        for stream in self.listener.incoming() {
-            self.handle_connection(&stream?)?;
+    fn resolve_uri(path: &str, root: &Path) -> std::io::Result<PathBuf> {
+        let path = path.trim_start_matches('/').trim_end_matches('/');
+        let index = "index.html";
+
+        if path.is_empty() {
+            return Ok(root.join(index));
         }
-        Ok(())
+
+        let full_path = root.join(path);
+
+        let canonical_full = full_path.canonicalize()?;
+        let canonical_root = root.canonicalize()?;
+
+        if !canonical_full.starts_with(&canonical_root) {
+            return Err(ErrorKind::PermissionDenied.into());
+        }
+
+        if canonical_full.is_file() {
+            return Ok(canonical_full);
+        }
+
+        if !canonical_full.is_dir() {
+            return Err(ErrorKind::NotFound.into());
+        }
+
+        let index_path = canonical_full.join(index);
+        if index_path.is_file() {
+            Ok(index_path)
+        } else {
+            Err(ErrorKind::NotFound.into())
+        }
     }
 
     fn send_response(
@@ -242,10 +281,7 @@ impl Logger {
         // TODO: Properly obtain remote user
         let remote_user = "\"-\"".to_string();
         let time_local = Zoned::now().strftime("%d/%b/%Y:%H:%M:%S %z").to_string();
-        let request_line = format!(
-            "{:?} {} {:?}",
-            request.method, request.path, request.version
-        );
+        let request_line = format!("{:?} {} {:?}", request.method, request.uri, request.version);
         let status = response.status.code();
         let body_bytes_sent = response.body.as_ref().map_or(0, String::len);
         let referer = headers.get("Referer").map_or("-", |h| h);
@@ -325,7 +361,9 @@ impl FromStr for HttpMethod {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum HttpStatus {
+    Forbidden,
     HttpVersionNotSupported,
+    InternalServerError,
     MethodNotAllowed,
     NotFound,
     Ok,
@@ -334,7 +372,9 @@ enum HttpStatus {
 impl fmt::Display for HttpStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let status_text = match self {
+            Self::Forbidden => "Forbidden",
             Self::HttpVersionNotSupported => "Http Version Not Supported",
+            Self::InternalServerError => "Interal Server Errror",
             Self::MethodNotAllowed => "Method Not Allowed",
             Self::NotFound => "Not Found",
             Self::Ok => "Ok",
@@ -346,7 +386,9 @@ impl fmt::Display for HttpStatus {
 impl HttpStatus {
     const fn code(self) -> u16 {
         match &self {
+            Self::Forbidden => 403,
             Self::HttpVersionNotSupported => 505,
+            Self::InternalServerError => 500,
             Self::MethodNotAllowed => 405,
             Self::NotFound => 404,
             Self::Ok => 200,
@@ -360,7 +402,7 @@ type HttpHeaders = HashMap<String, String>;
 #[derive(Debug, Clone, PartialEq)]
 pub struct HttpRequest {
     method: HttpMethod,
-    path: String,
+    uri: String,
     version: HttpVersion,
     headers: Option<HttpHeaders>,
     body: Option<String>,
@@ -376,7 +418,7 @@ impl HttpRequest {
     ) -> Self {
         Self {
             method,
-            path,
+            uri: path,
             version,
             headers,
             body,
