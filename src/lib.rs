@@ -121,9 +121,7 @@ impl HttpFileServer {
     }
 
     pub fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
-        for stream in self.listener.incoming() {
-            self.handle_connection(&stream?)?;
-        }
+        for stream in self.listener.incoming() {}
         Ok(())
     }
 
@@ -217,9 +215,7 @@ impl HttpFileServer {
         mut stream: &TcpStream,
         response: &HttpResponse,
     ) -> Result<(), Box<dyn Error>> {
-        write!(stream, "{response}")?;
-
-        stream.flush()?;
+        stream.write_all(response.to_string().as_bytes())?;
 
         Ok(())
     }
