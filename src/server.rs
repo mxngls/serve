@@ -127,7 +127,10 @@ impl<T: Logger> HttpFileServer<T> {
     }
 
     fn handle_connection(&self, stream: &TcpStream) -> Result<(), Box<dyn Error>> {
-        let request = HttpRequest::from_stream(stream)?;
+        let Some(request) = HttpRequest::from_stream(stream)? else {
+            // TODO: for now we simply drop connections containing empty requests
+            return Ok(());
+        };
 
         if request.method != HttpMethod::Get {
             return Self::send_response(
@@ -317,7 +320,7 @@ impl HttpStatus {
 /// HTTP headers defined as a type alias to `HashMap<String, String>`
 type HttpHeaders = HashMap<String, String>;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpRequest {
     pub method: HttpMethod,
     pub uri: String,
@@ -343,11 +346,11 @@ impl HttpRequest {
         }
     }
 
-    pub fn from_stream(stream: &TcpStream) -> Result<Self, Box<dyn Error>> {
+    pub fn from_stream(stream: &TcpStream) -> Result<Option<Self>, Box<dyn Error>> {
         let mut lines = BufReader::new(stream).lines();
 
         let Some(request_line) = lines.next().transpose()? else {
-            return Err("Empty request".into());
+            return Ok(None);
         };
 
         let [method_str, target, version_str] = request_line
@@ -362,7 +365,7 @@ impl HttpRequest {
 
         let request = Self::new(method, target.to_string(), version, Some(headers), None);
 
-        Ok(request)
+        Ok(Some(request))
     }
 
     fn parse_request_headers(
