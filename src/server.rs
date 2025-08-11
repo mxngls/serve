@@ -121,29 +121,42 @@ impl<T: Logger> HttpFileServer<T> {
 
     pub fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         for stream in self.listener.incoming() {
-            self.handle_connection(&stream?)?;
+            self.handle_connection(&stream?);
         }
         Ok(())
     }
 
-    fn handle_connection(&self, stream: &TcpStream) -> Result<(), Box<dyn Error>> {
-        let Some(request) = HttpRequest::from_stream(stream)? else {
-            // TODO: for now we simply drop connections containing empty requests
-            return Ok(());
+    fn handle_connection(&self, stream: &TcpStream) {
+        let peer_addr = stream
+            .peer_addr()
+            .map_or("unknown".to_string(), |addr| addr.to_string());
+
+        let request = match HttpRequest::from_stream(stream) {
+            Ok(Some(request)) => request,
+            Ok(None) => return,
+            Err(e) => {
+                let status = e.into();
+                return Self::send_response(stream, &HttpResponse::new(status, None, None));
+            }
         };
 
+        let response = self.process_request(&request);
+
+        Self::send_response(stream, &response);
+
+        let _ = self
+            .logger
+            .write_request_log(&request, &response, &peer_addr)
+            .inspect_err(|e| eprintln!("Failed to write request log: {e}"));
+    }
+
+    fn process_request(&self, request: &HttpRequest) -> HttpResponse {
         if request.method != HttpMethod::Get {
-            return Self::send_response(
-                stream,
-                &HttpResponse::new(HttpStatus::MethodNotAllowed, None, None),
-            );
+            return HttpResponse::new(HttpStatus::MethodNotAllowed, None, None);
         }
 
-        if request.version != HttpVersion::HTTP1_1 {
-            return Self::send_response(
-                stream,
-                &HttpResponse::new(HttpStatus::HttpVersionNotSupported, None, None),
-            );
+        if request.version != HttpVersion::HTTP1_0 {
+            return HttpResponse::new(HttpStatus::HttpVersionNotSupported, None, None);
         }
 
         // match the request URI to actual file paths
@@ -155,10 +168,12 @@ impl<T: Logger> HttpFileServer<T> {
                     ErrorKind::NotFound => HttpStatus::NotFound,
                     _ => HttpStatus::InternalServerError,
                 };
-                return Self::send_response(stream, &HttpResponse::new(status, None, None));
+                return HttpResponse::new(status, None, None);
             }
         };
-        let response_body = fs::read_to_string(&path)?;
+        let Ok(response_body) = fs::read_to_string(&path) else {
+            return HttpResponse::new(HttpStatus::InternalServerError, None, None);
+        };
 
         // handle the case where ther might be no extension or invalid UTF-8
         let mime_type_str = path
@@ -173,13 +188,7 @@ impl<T: Logger> HttpFileServer<T> {
 
         headers.insert("Content-Type".to_string(), mime_type_str);
 
-        let response = HttpResponse::new(HttpStatus::Ok, Some(headers), Some(response_body));
-
-        Self::send_response(stream, &response)?;
-        self.logger
-            .write_request_log(&request, &response, &stream.peer_addr()?.to_string())?;
-
-        Ok(())
+        HttpResponse::new(HttpStatus::Ok, Some(headers), Some(response_body))
     }
 
     fn resolve_uri(path: &str, root: &Path) -> std::io::Result<PathBuf> {
@@ -215,42 +224,36 @@ impl<T: Logger> HttpFileServer<T> {
         }
     }
 
-    fn send_response(
-        mut stream: &TcpStream,
-        response: &HttpResponse,
-    ) -> Result<(), Box<dyn Error>> {
-        stream.write_all(response.to_string().as_bytes())?;
+    fn send_response(stream: &TcpStream, response: &HttpResponse) {
+        let mut stream = stream;
 
-        Ok(())
+        if write!(stream, "{response}").is_err() {
+            let error_response = HttpResponse::new(HttpStatus::InternalServerError, None, None);
+            let _ = write!(stream, "{error_response}");
+        }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpVersion {
     HTTP1_0,
-    HTTP1_1,
-    HTTP2_0,
 }
 
 impl fmt::Display for HttpVersion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let version = match self {
             Self::HTTP1_0 => "HTTP/1.0",
-            Self::HTTP1_1 => "HTTP/1.1",
-            Self::HTTP2_0 => "HTTP/2.0",
         };
         write!(f, "{version}")
     }
 }
 
 impl FromStr for HttpVersion {
-    type Err = &'static str;
+    type Err = ParseRequestError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "HTTP/1.0" => Ok(Self::HTTP1_0),
-            "HTTP/1.1" => Ok(Self::HTTP1_1),
-            "HTTP/2.0" => Ok(Self::HTTP2_0),
-            _ => Err("Unsupported HTTP version"),
+            _ => Err(ParseRequestError::UnsupportedHttpVersion),
         }
     }
 }
@@ -270,18 +273,19 @@ impl fmt::Display for HttpMethod {
 }
 
 impl FromStr for HttpMethod {
-    type Err = &'static str;
+    type Err = ParseRequestError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "GET" => Ok(Self::Get),
-            _ => Err("Unsupported HTTP method"),
+            _ => Err(ParseRequestError::InvalidMethod),
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpStatus {
+    BadRequest,
     Forbidden,
     HttpVersionNotSupported,
     InternalServerError,
@@ -293,6 +297,7 @@ pub enum HttpStatus {
 impl fmt::Display for HttpStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let status_text = match self {
+            Self::BadRequest => "Bad Request",
             Self::Forbidden => "Forbidden",
             Self::HttpVersionNotSupported => "Http Version Not Supported",
             Self::InternalServerError => "Interal Server Errror",
@@ -304,9 +309,22 @@ impl fmt::Display for HttpStatus {
     }
 }
 
+impl From<ParseRequestError> for HttpStatus {
+    fn from(error: ParseRequestError) -> Self {
+        match error {
+            ParseRequestError::UnsupportedHttpVersion => Self::HttpVersionNotSupported,
+            ParseRequestError::MalformedRequest(_)
+            | ParseRequestError::InvalidMethod
+            | ParseRequestError::InvalidUri => Self::BadRequest,
+            ParseRequestError::IoError(_) => Self::InternalServerError,
+        }
+    }
+}
+
 impl HttpStatus {
     pub const fn code(self) -> u16 {
         match &self {
+            Self::BadRequest => 400,
             Self::Forbidden => 403,
             Self::HttpVersionNotSupported => 505,
             Self::InternalServerError => 500,
@@ -346,7 +364,7 @@ impl HttpRequest {
         }
     }
 
-    pub fn from_stream(stream: &TcpStream) -> Result<Option<Self>, Box<dyn Error>> {
+    pub fn from_stream(stream: &TcpStream) -> Result<Option<Self>, ParseRequestError> {
         let mut lines = BufReader::new(stream).lines();
 
         let Some(request_line) = lines.next().transpose()? else {
@@ -357,8 +375,12 @@ impl HttpRequest {
             .split_whitespace()
             .collect::<Vec<&str>>()
             .try_into()
-            .map_err(|_| "Invalid request line format")?;
-        let headers = Self::parse_request_headers(&mut lines)?;
+            .map_err(|_| {
+                ParseRequestError::MalformedRequest(format!(
+                    "Malformed request line: {request_line}"
+                ))
+            })?;
+        let headers = Self::parse_headers(&mut lines)?;
 
         let method = method_str.parse()?;
         let version = version_str.parse()?;
@@ -368,11 +390,10 @@ impl HttpRequest {
         Ok(Some(request))
     }
 
-    fn parse_request_headers(
+    fn parse_headers(
         lines: &mut Lines<BufReader<&TcpStream>>,
-    ) -> Result<HttpHeaders, Box<dyn Error>> {
+    ) -> Result<HttpHeaders, ParseRequestError> {
         let mut headers = HttpHeaders::new();
-        let mut has_host = false;
 
         for line in lines {
             let line = line?;
@@ -385,23 +406,45 @@ impl HttpRequest {
             let (field_name, field_value) = line
                 .split_once(':')
                 .map(|(f1, f2)| (f1.trim(), f2.trim()))
-                .ok_or_else(|| format!("Malformed header: {line}"))?;
+                .ok_or_else(|| {
+                    ParseRequestError::MalformedRequest(format!("Malformed header: {line}"))
+                })?;
 
             // TODO: Currently the parsing of headers does not NOT conform to rfc9110.
             // See: https://www.rfc-editor.org/rfc/rfc9110.html#name-field-order
             headers.insert(field_name.trim().to_owned(), field_value.trim().to_owned());
-
-            // In HTTP/1.1 all headers **except** for the host header are optional
-            if !has_host && field_name == "Host" && !field_value.is_empty() {
-                has_host = true;
-            }
         }
 
-        if has_host {
-            Ok(headers)
-        } else {
-            Err("Missing Host header".into())
+        Ok(headers)
+    }
+}
+
+#[derive(Debug)]
+pub enum ParseRequestError {
+    UnsupportedHttpVersion,
+    MalformedRequest(String),
+    InvalidMethod,
+    InvalidUri,
+    IoError(std::io::Error),
+}
+
+impl Error for ParseRequestError {}
+
+impl fmt::Display for ParseRequestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedHttpVersion => f.write_str("Unsupported HTTP version"),
+            Self::MalformedRequest(msg) => write!(f, "Malformed request: {msg}"),
+            Self::InvalidMethod => f.write_str("Invalid method"),
+            Self::InvalidUri => f.write_str("Invalid URI"),
+            Self::IoError(err) => write!(f, "I/O error: {err}"),
         }
+    }
+}
+
+impl From<std::io::Error> for ParseRequestError {
+    fn from(error: std::io::Error) -> Self {
+        Self::IoError(error)
     }
 }
 
@@ -430,7 +473,7 @@ impl HttpResponse {
         }
 
         Self {
-            version: HttpVersion::HTTP1_1,
+            version: HttpVersion::HTTP1_0,
             status,
             headers: Some(headers),
             body,
