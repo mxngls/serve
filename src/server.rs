@@ -5,10 +5,14 @@ use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Lines, Write};
+use std::net::Shutdown;
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::result::Result;
 use std::str::FromStr;
+
+use jiff::Timestamp;
+use jiff::tz::TimeZone;
 
 use crate::Logger;
 
@@ -121,7 +125,12 @@ impl<T: Logger> HttpFileServer<T> {
 
     pub fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         for stream in self.listener.incoming() {
-            self.handle_connection(&stream?);
+            let stream = stream?;
+
+            self.handle_connection(&stream);
+
+            // HTTP/1.0 expects connections to be closed by the server
+            let _ = stream.shutdown(Shutdown::Both);
         }
         Ok(())
     }
@@ -151,15 +160,11 @@ impl<T: Logger> HttpFileServer<T> {
     }
 
     fn process_request(&self, request: &HttpRequest) -> HttpResponse {
-        if request.method != HttpMethod::Get {
-            return HttpResponse::new(HttpStatus::MethodNotAllowed, None, None);
-        }
+        let mut headers = HttpHeaders::new();
 
-        if request.version != HttpVersion::HTTP1_0 {
-            return HttpResponse::new(HttpStatus::HttpVersionNotSupported, None, None);
-        }
-
-        // match the request URI to actual file paths
+        // TODO:
+        // Currently we assume relative URIs by default. We should probably add some kind of
+        // heuristic to parse paths properly for absolute ones as well
         let path = match Self::resolve_uri(request.uri.as_str(), &self.root_dir) {
             Ok(path) => path,
             Err(err) => {
@@ -171,8 +176,14 @@ impl<T: Logger> HttpFileServer<T> {
                 return HttpResponse::new(status, None, None);
             }
         };
-        let Ok(response_body) = fs::read_to_string(&path) else {
-            return HttpResponse::new(HttpStatus::InternalServerError, None, None);
+        let response_body = match request.method {
+            HttpMethod::Get => {
+                let Ok(body) = fs::read_to_string(&path) else {
+                    return HttpResponse::new(HttpStatus::InternalServerError, None, None);
+                };
+                Some(body)
+            }
+            HttpMethod::Head => None,
         };
 
         // handle the case where ther might be no extension or invalid UTF-8
@@ -184,11 +195,9 @@ impl<T: Logger> HttpFileServer<T> {
             .as_str()
             .to_string();
 
-        let mut headers = HttpHeaders::new();
-
         headers.insert("Content-Type".to_string(), mime_type_str);
 
-        HttpResponse::new(HttpStatus::Ok, Some(headers), Some(response_body))
+        HttpResponse::new(HttpStatus::Ok, Some(headers), response_body)
     }
 
     fn resolve_uri(path: &str, root: &Path) -> std::io::Result<PathBuf> {
@@ -237,12 +246,14 @@ impl<T: Logger> HttpFileServer<T> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpVersion {
     HTTP1_0,
+    HTTP1_1,
 }
 
 impl fmt::Display for HttpVersion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let version = match self {
             Self::HTTP1_0 => "HTTP/1.0",
+            Self::HTTP1_1 => "HTTP/1.1",
         };
         write!(f, "{version}")
     }
@@ -253,6 +264,7 @@ impl FromStr for HttpVersion {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "HTTP/1.0" => Ok(Self::HTTP1_0),
+            "HTTP/1.1" => Ok(Self::HTTP1_1),
             _ => Err(ParseRequestError::UnsupportedHttpVersion),
         }
     }
@@ -299,7 +311,7 @@ impl fmt::Display for HttpStatus {
         let status_text = match self {
             Self::BadRequest => "Bad Request",
             Self::Forbidden => "Forbidden",
-            Self::HttpVersionNotSupported => "Http Version Not Supported",
+            Self::HttpVersionNotSupported => "HTTP Version Not Supported",
             Self::InternalServerError => "Interal Server Errror",
             Self::MethodNotAllowed => "Method Not Allowed",
             Self::NotFound => "Not Found",
