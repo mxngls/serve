@@ -176,15 +176,23 @@ impl<T: Logger> HttpFileServer<T> {
                 return HttpResponse::new(status, None, None);
             }
         };
-        let response_body = match request.method {
+
+        let mut response_body = None;
+        match request.method {
             HttpMethod::Get => {
                 let Ok(body) = fs::read_to_string(&path) else {
                     return HttpResponse::new(HttpStatus::InternalServerError, None, None);
                 };
-                Some(body)
+                headers.insert("Content-Length".to_string(), body.len().to_string());
+                response_body = Some(body);
             }
-            HttpMethod::Head => None,
-        };
+            HttpMethod::Head => {
+                let Ok(metadata) = fs::metadata(&path) else {
+                    return HttpResponse::new(HttpStatus::InternalServerError, None, None);
+                };
+                headers.insert("Content-Length".to_string(), metadata.len().to_string());
+            }
+        }
 
         // handle the case where ther might be no extension or invalid UTF-8
         let mime_type_str = path
@@ -273,12 +281,14 @@ impl FromStr for HttpVersion {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpMethod {
     Get,
+    Head,
 }
 
 impl fmt::Display for HttpMethod {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let method = match self {
             Self::Get => "GET",
+            Self::Head => "HEAD",
         };
         write!(f, "{method}")
     }
@@ -290,6 +300,7 @@ impl FromStr for HttpMethod {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "GET" => Ok(Self::Get),
+            "HEAD" => Ok(Self::Head),
             _ => Err(ParseRequestError::InvalidMethod),
         }
     }
@@ -464,7 +475,7 @@ impl From<std::io::Error> for ParseRequestError {
 pub struct HttpResponse {
     pub version: HttpVersion,
     pub status: HttpStatus,
-    pub headers: Option<HttpHeaders>,
+    pub headers: HttpHeaders,
     pub body: Option<String>,
 }
 
@@ -473,6 +484,20 @@ impl HttpResponse {
         let mut headers = headers.unwrap_or_default();
 
         // add default headers
+        headers.insert(
+            "Date".to_string(),
+            // Date formatted according to RFC1123
+            // see https://datatracker.ietf.org/doc/html/rfc1945#section-3.3
+            Timestamp::now()
+                .to_zoned(TimeZone::UTC)
+                .strftime("%a, %d %b %Y %H:%M:%S GMT")
+                .to_string(),
+        );
+        headers.insert("Connection".to_string(), "close".to_string());
+        // NOTE: while not beeing strictly necessary adding a server header seems to be common practice
+        // so we will just do that as well
+        headers.insert("Server".to_string(), env!("CARGO_PKG_VERSION").to_string());
+
         if let Some(ref body) = body {
             if !headers.contains_key("Content-Length") {
                 let body_len = body.len();
@@ -487,7 +512,7 @@ impl HttpResponse {
         Self {
             version: HttpVersion::HTTP1_0,
             status,
-            headers: Some(headers),
+            headers,
             body,
         }
     }
@@ -500,12 +525,9 @@ impl fmt::Display for HttpResponse {
         // status line
         writeln!(f, "{} {} {}", self.version, self.status.code(), self.status)?;
 
-        // headers
-        if let Some(headers) = &self.headers {
-            for (field_name, field_value) in headers {
-                writeln!(f, "{field_name}: {field_value}")?;
-            }
-        }
+        self.headers
+            .iter()
+            .try_for_each(|(field_name, field_value)| writeln!(f, "{field_name}: {field_value}"))?;
 
         // empty line
         writeln!(f)?;
